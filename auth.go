@@ -541,6 +541,17 @@ func (a *AuthPlugin) verifyJWT(tokenString string) (*JWTClaims, error) {
 
     a.debugLog("JWT Header - Algorithm: %s, Type: %s, Key ID: %s", header.Alg, header.Typ, header.Kid)
 
+    // Only allow RS256 algorithm for security
+    if header.Alg != "RS256" {
+        return nil, fmt.Errorf("unsupported or insecure JWT algorithm: %s (only RS256 allowed)", header.Alg)
+    }
+
+    // Verify signature FIRST to prevent timing attacks on claims
+    if err := a.verifyRS256Signature(parts, header.Kid); err != nil {
+        return nil, fmt.Errorf("signature verification failed: %v", err)
+    }
+
+    // Only process claims after signature verification succeeds
     claimsData, err := base64.RawURLEncoding.DecodeString(parts[1])
     if err != nil {
         return nil, fmt.Errorf("failed to decode JWT claims: %v", err)
@@ -556,6 +567,7 @@ func (a *AuthPlugin) verifyJWT(tokenString string) (*JWTClaims, error) {
     a.debugLog("JWT Claims - Expires: %d, Issued: %d, Email Verified: %t", 
         claims.Exp, claims.Iat, claims.EmailVerified)
 
+    // Validate claims after signature verification
     if time.Now().Unix() > claims.Exp {
         return nil, fmt.Errorf("JWT token expired")
     }
@@ -564,17 +576,40 @@ func (a *AuthPlugin) verifyJWT(tokenString string) (*JWTClaims, error) {
         return nil, fmt.Errorf("invalid issuer: expected %s, got %s", a.config.IssuerUrl, claims.Iss)
     }
 
-    // Only allow RS256 algorithm for security
-    if header.Alg != "RS256" {
-        return nil, fmt.Errorf("unsupported or insecure JWT algorithm: %s (only RS256 allowed)", header.Alg)
-    }
-
-    // Verify signature first before processing claims
-    if err := a.verifyRS256Signature(parts, header.Kid); err != nil {
-        return nil, fmt.Errorf("signature verification failed: %v", err)
+    // Validate audience claim
+    if !a.validateAudience(claims.Aud) {
+        return nil, fmt.Errorf("invalid audience: token not intended for this client")
     }
 
     return &claims, nil
+}
+
+func (a *AuthPlugin) validateAudience(aud interface{}) bool {
+    if aud == nil {
+        return false
+    }
+
+    // Audience can be a string or array of strings
+    switch audience := aud.(type) {
+    case string:
+        return audience == a.config.ClientId
+    case []interface{}:
+        for _, audItem := range audience {
+            if audStr, ok := audItem.(string); ok && audStr == a.config.ClientId {
+                return true
+            }
+        }
+        return false
+    case []string:
+        for _, audStr := range audience {
+            if audStr == a.config.ClientId {
+                return true
+            }
+        }
+        return false
+    default:
+        return false
+    }
 }
 
 func (a *AuthPlugin) verifyRS256Signature(parts []string, keyId string) error {
