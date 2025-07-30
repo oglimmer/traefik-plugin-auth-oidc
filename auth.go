@@ -564,12 +564,14 @@ func (a *AuthPlugin) verifyJWT(tokenString string) (*JWTClaims, error) {
         return nil, fmt.Errorf("invalid issuer: expected %s, got %s", a.config.IssuerUrl, claims.Iss)
     }
 
-    if header.Alg == "RS256" {
-        if err := a.verifyRS256Signature(parts, header.Kid); err != nil {
-            return nil, fmt.Errorf("signature verification failed: %v", err)
-        }
-    } else {
-        a.debugLog("Signature verification skipped for algorithm: %s", header.Alg)
+    // Only allow RS256 algorithm for security
+    if header.Alg != "RS256" {
+        return nil, fmt.Errorf("unsupported or insecure JWT algorithm: %s (only RS256 allowed)", header.Alg)
+    }
+
+    // Verify signature first before processing claims
+    if err := a.verifyRS256Signature(parts, header.Kid); err != nil {
+        return nil, fmt.Errorf("signature verification failed: %v", err)
     }
 
     return &claims, nil
