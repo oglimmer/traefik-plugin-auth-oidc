@@ -1,0 +1,7 @@
+# Traefik plugin manifest
+displayName: "OIDC Auth Middleware"
+type: middleware
+import: "github.com/oglimmer/traefik-plugin-auth"
+summary: "A simple but working  cookie-based auth redirect middleware supporting OIDC."
+testData:
+  dummy: "value"
