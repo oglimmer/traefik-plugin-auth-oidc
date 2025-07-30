@@ -31,6 +31,27 @@ http:
           debug: false
 ```
 
+or as CLI
+
+```bash
+  - "--experimental.localPlugins.traefikpluginauth.modulename=github.com/oglimmer/traefik-plugin-auth"
+```
+
+in a docker container mount as `- ./plugins-local/src/github.com/oglimmer/traefik-plugin-auth:/plugins-local/src/github.com/oglimmer/traefik-plugin-auth`
+
+then using this as
+
+```yml
+       - "traefik.http.routers.http-app.middlewares=siteauth"
+      - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.issuerUrl=https://your-oidc-provider.com"
+      - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.clientId=your-client-id"
+      - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.clientSecret=your-client-secret"
+      - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.redirectUrl=https://your-app.com/oauth2/callback"
+      - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.scopes[0]=openid"
+      - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.scopes[1]=email"
+      - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.allowedUsers[0]=user@foobar.de"
+```
+
 ### Configuration Parameters
 
 | Parameter | Type | Required | Default | Description |
