@@ -2,12 +2,18 @@ package traefik_plugin_auth
 
 import (
     "context"
+    "crypto"
     "crypto/rand"
+    "crypto/rsa"
+    "crypto/sha256"
+    "crypto/x509"
     "encoding/base64"
     "encoding/json"
+    "encoding/pem"
     "fmt"
     "io"
     "log"
+    "math/big"
     "net/http"
     "net/url"
     "strings"
@@ -23,12 +29,46 @@ type Config struct {
     Scopes        []string `json:"scopes"`
     SkippedPaths  []string `json:"skippedPaths"`
     Debug         bool     `json:"debug"`
+    AllowedUsers  []string `json:"allowedUsers"`
+}
+
+type JWTHeader struct {
+    Alg string `json:"alg"`
+    Typ string `json:"typ"`
+    Kid string `json:"kid"`
+}
+
+type JWTClaims struct {
+    Iss           string `json:"iss"`
+    Sub           string `json:"sub"`
+    Aud           interface{} `json:"aud"`
+    Exp           int64  `json:"exp"`
+    Iat           int64  `json:"iat"`
+    AuthTime      int64  `json:"auth_time,omitempty"`
+    Nonce         string `json:"nonce,omitempty"`
+    Email         string `json:"email,omitempty"`
+    EmailVerified bool   `json:"email_verified,omitempty"`
+    Name          string `json:"name,omitempty"`
+    PreferredUsername string `json:"preferred_username,omitempty"`
+}
+
+type JWK struct {
+    Kty string `json:"kty"`
+    Use string `json:"use"`
+    Kid string `json:"kid"`
+    N   string `json:"n"`
+    E   string `json:"e"`
+}
+
+type JWKSet struct {
+    Keys []JWK `json:"keys"`
 }
 
 func CreateConfig() *Config {
     return &Config{
         Scopes: []string{"openid", "profile", "email"},
         SkippedPaths: []string{},
+        AllowedUsers: []string{},
     }
 }
 
@@ -212,6 +252,24 @@ func (a *AuthPlugin) handleCallback(rw http.ResponseWriter, req *http.Request) {
     }
 
     a.debugLog("Token received successfully, expires in %d seconds", tokenResp.ExpiresIn)
+
+    // Verify the ID token and check user authorization before storing
+    if tokenResp.IdToken != "" {
+        claims, err := a.verifyJWT(tokenResp.IdToken)
+        if err != nil {
+            a.debugLog("JWT verification failed during callback: %v", err)
+            http.Error(rw, "Unauthorized: Invalid token", http.StatusUnauthorized)
+            return
+        }
+
+        if !a.isUserAllowed(claims) {
+            a.debugLog("User not allowed access during callback")
+            http.Error(rw, "Unauthorized: Access denied", http.StatusUnauthorized)
+            return
+        }
+        
+        a.debugLog("User %s authorized successfully", claims.Email)
+    }
 
     // Generate a session ID
     sessionID, err := generateRandomString(32)
@@ -445,7 +503,188 @@ func (a *AuthPlugin) validateTokenData(tokenData map[string]interface{}) bool {
         a.debugLog("No expiry time found in token, assuming valid")
     }
 
+    idToken, ok := tokenData["id_token"].(string)
+    if !ok || idToken == "" {
+        a.debugLog("No ID token found in token data")
+        return false
+    }
+
+    claims, err := a.verifyJWT(idToken)
+    if err != nil {
+        a.debugLog("JWT verification failed: %v", err)
+        return false
+    }
+
+    if !a.isUserAllowed(claims) {
+        a.debugLog("User not allowed access")
+        return false
+    }
+
     return true
+}
+
+func (a *AuthPlugin) verifyJWT(tokenString string) (*JWTClaims, error) {
+    parts := strings.Split(tokenString, ".")
+    if len(parts) != 3 {
+        return nil, fmt.Errorf("invalid JWT format")
+    }
+
+    headerData, err := base64.RawURLEncoding.DecodeString(parts[0])
+    if err != nil {
+        return nil, fmt.Errorf("failed to decode JWT header: %v", err)
+    }
+
+    var header JWTHeader
+    if err := json.Unmarshal(headerData, &header); err != nil {
+        return nil, fmt.Errorf("failed to unmarshal JWT header: %v", err)
+    }
+
+    a.debugLog("JWT Header - Algorithm: %s, Type: %s, Key ID: %s", header.Alg, header.Typ, header.Kid)
+
+    claimsData, err := base64.RawURLEncoding.DecodeString(parts[1])
+    if err != nil {
+        return nil, fmt.Errorf("failed to decode JWT claims: %v", err)
+    }
+
+    var claims JWTClaims
+    if err := json.Unmarshal(claimsData, &claims); err != nil {
+        return nil, fmt.Errorf("failed to unmarshal JWT claims: %v", err)
+    }
+
+    a.debugLog("JWT Claims - Subject: %s, Email: %s, Name: %s, Username: %s, Issuer: %s", 
+        claims.Sub, claims.Email, claims.Name, claims.PreferredUsername, claims.Iss)
+    a.debugLog("JWT Claims - Expires: %d, Issued: %d, Email Verified: %t", 
+        claims.Exp, claims.Iat, claims.EmailVerified)
+
+    if time.Now().Unix() > claims.Exp {
+        return nil, fmt.Errorf("JWT token expired")
+    }
+
+    if claims.Iss != a.config.IssuerUrl {
+        return nil, fmt.Errorf("invalid issuer: expected %s, got %s", a.config.IssuerUrl, claims.Iss)
+    }
+
+    if header.Alg == "RS256" {
+        if err := a.verifyRS256Signature(parts, header.Kid); err != nil {
+            return nil, fmt.Errorf("signature verification failed: %v", err)
+        }
+    } else {
+        a.debugLog("Signature verification skipped for algorithm: %s", header.Alg)
+    }
+
+    return &claims, nil
+}
+
+func (a *AuthPlugin) verifyRS256Signature(parts []string, keyId string) error {
+    jwks, err := a.fetchJWKS()
+    if err != nil {
+        return fmt.Errorf("failed to fetch JWKS: %v", err)
+    }
+
+    var publicKey *rsa.PublicKey
+    for _, key := range jwks.Keys {
+        if key.Kid == keyId && key.Kty == "RSA" {
+            publicKey, err = a.jwkToRSAPublicKey(key)
+            if err != nil {
+                return fmt.Errorf("failed to convert JWK to RSA public key: %v", err)
+            }
+            break
+        }
+    }
+
+    if publicKey == nil {
+        return fmt.Errorf("no matching public key found for kid: %s", keyId)
+    }
+
+    signatureData, err := base64.RawURLEncoding.DecodeString(parts[2])
+    if err != nil {
+        return fmt.Errorf("failed to decode signature: %v", err)
+    }
+
+    message := parts[0] + "." + parts[1]
+    hash := sha256.Sum256([]byte(message))
+
+    err = rsa.VerifyPKCS1v15(publicKey, crypto.SHA256, hash[:], signatureData)
+    if err != nil {
+        return fmt.Errorf("signature verification failed: %v", err)
+    }
+
+    a.debugLog("JWT signature verified successfully")
+    return nil
+}
+
+func (a *AuthPlugin) fetchJWKS() (*JWKSet, error) {
+    if a.endpoints.JwksUri == "" {
+        return nil, fmt.Errorf("no JWKS URI configured")
+    }
+
+    a.debugLog("Fetching JWKS from: %s", a.endpoints.JwksUri)
+    resp, err := http.Get(a.endpoints.JwksUri)
+    if err != nil {
+        return nil, err
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != http.StatusOK {
+        return nil, fmt.Errorf("JWKS endpoint returned status: %d", resp.StatusCode)
+    }
+
+    body, err := io.ReadAll(resp.Body)
+    if err != nil {
+        return nil, err
+    }
+
+    var jwks JWKSet
+    if err := json.Unmarshal(body, &jwks); err != nil {
+        return nil, err
+    }
+
+    a.debugLog("Fetched %d keys from JWKS", len(jwks.Keys))
+    return &jwks, nil
+}
+
+func (a *AuthPlugin) jwkToRSAPublicKey(jwk JWK) (*rsa.PublicKey, error) {
+    nBytes, err := base64.RawURLEncoding.DecodeString(jwk.N)
+    if err != nil {
+        return nil, err
+    }
+
+    eBytes, err := base64.RawURLEncoding.DecodeString(jwk.E)
+    if err != nil {
+        return nil, err
+    }
+
+    n := big.NewInt(0)
+    n.SetBytes(nBytes)
+
+    e := 0
+    for _, b := range eBytes {
+        e = e*256 + int(b)
+    }
+
+    return &rsa.PublicKey{N: n, E: e}, nil
+}
+
+func (a *AuthPlugin) isUserAllowed(claims *JWTClaims) bool {
+    if len(a.config.AllowedUsers) == 0 {
+        a.debugLog("No user restrictions configured, allowing access")
+        return true
+    }
+
+    if claims.Email == "" {
+        a.debugLog("No email found in JWT claims, access denied")
+        return false
+    }
+
+    for _, allowedEmail := range a.config.AllowedUsers {
+        if claims.Email == allowedEmail {
+            a.debugLog("User allowed: email %s matches allowed list", claims.Email)
+            return true
+        }
+    }
+
+    a.debugLog("User email %s not in allowed list: %v", claims.Email, a.config.AllowedUsers)
+    return false
 }
 
 func (a *AuthPlugin) initiateOAuth2Flow(rw http.ResponseWriter, req *http.Request) {
