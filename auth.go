@@ -6,10 +6,8 @@ import (
     "crypto/rand"
     "crypto/rsa"
     "crypto/sha256"
-    "crypto/x509"
     "encoding/base64"
     "encoding/json"
-    "encoding/pem"
     "fmt"
     "io"
     "log"
@@ -30,6 +28,7 @@ type Config struct {
     SkippedPaths  []string `json:"skippedPaths"`
     Debug         bool     `json:"debug"`
     AllowedUsers  []string `json:"allowedUsers"`
+    BasicAuth     string   `json:"basicAuth"`
 }
 
 type JWTHeader struct {
@@ -197,13 +196,20 @@ func (a *AuthPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
         return
     }
 
+    // Check basic auth first if configured
+    if a.validateBasicAuth(req) {
+        a.debugLog("Basic auth validation successful, proceeding to next handler")
+        a.next.ServeHTTP(rw, req)
+        return
+    }
+
     if a.hasValidToken(req) {
         a.debugLog("Valid token found, proceeding to next handler")
         a.next.ServeHTTP(rw, req)
         return
     }
 
-    a.debugLog("No valid token, initiating OAuth2 flow")
+    a.debugLog("No valid authentication, initiating OAuth2 flow")
     a.initiateOAuth2Flow(rw, req)
 }
 
@@ -721,6 +727,36 @@ func (a *AuthPlugin) isUserAllowed(claims *JWTClaims) bool {
     }
 
     a.debugLog("User email %s not in allowed list: %v", claims.Email, a.config.AllowedUsers)
+    return false
+}
+
+func (a *AuthPlugin) validateBasicAuth(req *http.Request) bool {
+    if a.config.BasicAuth == "" {
+        return false
+    }
+
+    auth := req.Header.Get("Authorization")
+    if auth == "" {
+        return false
+    }
+
+    if !strings.HasPrefix(auth, "Basic ") {
+        return false
+    }
+
+    credentials, err := base64.StdEncoding.DecodeString(auth[6:])
+    if err != nil {
+        a.debugLog("Failed to decode basic auth credentials: %v", err)
+        return false
+    }
+
+    providedAuth := string(credentials)
+    if providedAuth == a.config.BasicAuth {
+        a.debugLog("Basic auth validation successful")
+        return true
+    }
+
+    a.debugLog("Basic auth validation failed")
     return false
 }
 
