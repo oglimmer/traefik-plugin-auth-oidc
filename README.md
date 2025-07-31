@@ -5,6 +5,7 @@ A Traefik middleware plugin that provides OIDC (OpenID Connect) authentication w
 ## Features
 
 - OIDC authentication flow with automatic endpoint discovery
+- **Fallback OIDC configuration** - uses `./openid-configuration.json` when OIDC discovery fails
 - Optional Basic Authentication support as an alternative to OIDC
 - Cookie-based session management with fallback token storage
 - Configurable redirect URLs and scopes
@@ -124,6 +125,34 @@ The plugin uses a dual-layer session management approach:
 2. Fallback to base64-encoded token cookies
 
 Sessions automatically expire based on the token expiration time from the OIDC provider.
+
+## Fallback Configuration
+
+The plugin includes a fallback mechanism for OIDC discovery failures. When the OIDC provider's `.well-known/openid-configuration` endpoint is unavailable, the plugin will attempt to load configuration from `./openid-configuration.json`.
+
+### Setting up Fallback Configuration
+
+1. **Replace the existing file**: The included `openid-configuration.json` file should be replaced with your OIDC provider's actual configuration
+2. **Obtain the configuration**: Download your provider's OIDC configuration from `https://your-provider.com/.well-known/openid-configuration`
+3. **Save as `openid-configuration.json`**: Place the downloaded configuration in the same directory as the plugin
+
+### Example Configuration Structure
+
+```json
+{
+  "issuer": "https://your-oidc-provider.com",
+  "authorization_endpoint": "https://your-oidc-provider.com/auth",
+  "token_endpoint": "https://your-oidc-provider.com/token",
+  "userinfo_endpoint": "https://your-oidc-provider.com/userinfo",
+  "jwks_uri": "https://your-oidc-provider.com/jwks",
+  "end_session_endpoint": "https://your-oidc-provider.com/logout"
+}
+```
+
+The fallback activates automatically when:
+- Network requests to the discovery endpoint fail
+- The discovery endpoint returns non-200 HTTP status
+- The discovery response cannot be parsed
 
 ## Development
 
