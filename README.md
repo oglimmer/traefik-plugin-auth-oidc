@@ -31,6 +31,7 @@ http:
           skippedPaths: []
           debug: false
           basicAuth: "user:password"  # Optional: enables basic auth as alternative
+          insecureTLS: false  # Optional: disable TLS certificate verification
 ```
 
 or as CLI
@@ -53,6 +54,7 @@ then using this as
       - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.scopes[1]=email"
       - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.allowedUsers[0]=user@foobar.de"
       - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.basicAuth=user:password"
+      - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.insecureTLS=true"
 ```
 
 ### Configuration Parameters
@@ -68,6 +70,7 @@ then using this as
 | `debug` | bool | No | `false` | Enable debug logging |
 | `allowedUsers` | []string | No | `[]` | List of allowed user emails for OIDC auth |
 | `basicAuth` | string | No | - | Basic auth credentials in format "user:password" |
+| `insecureTLS` | bool | No | `false` | Disable TLS certificate hostname verification |
 
 *Required only when `basicAuth` is not configured
 

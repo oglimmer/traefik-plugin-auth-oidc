@@ -6,6 +6,7 @@ import (
     "crypto/rand"
     "crypto/rsa"
     "crypto/sha256"
+    "crypto/tls"
     "encoding/base64"
     "encoding/json"
     "fmt"
@@ -29,6 +30,7 @@ type Config struct {
     Debug         bool     `json:"debug"`
     AllowedUsers  []string `json:"allowedUsers"`
     BasicAuth     string   `json:"basicAuth"`
+    InsecureTLS   bool     `json:"insecureTLS"`
 }
 
 type JWTHeader struct {
@@ -84,6 +86,19 @@ func (a *AuthPlugin) debugLog(format string, v ...interface{}) {
     if a.config.Debug {
         log.Printf("[AUTH-DEBUG] "+format, v...)
     }
+}
+
+func (a *AuthPlugin) getHTTPClient() *http.Client {
+    if a.config.InsecureTLS {
+        return &http.Client{
+            Transport: &http.Transport{
+                TLSClientConfig: &tls.Config{
+                    InsecureSkipVerify: true,
+                },
+            },
+        }
+    }
+    return http.DefaultClient
 }
 
 type SessionStore struct {
@@ -153,7 +168,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
     if config.Debug {
         log.Printf("[AUTH-DEBUG] Discovering OIDC endpoints for: %s", config.IssuerUrl)
     }
-    endpoints, err := discoverOIDCEndpoints(config.IssuerUrl, config.Debug)
+    endpoints, err := discoverOIDCEndpoints(config.IssuerUrl, config.Debug, config.InsecureTLS)
     if err != nil {
         if config.Debug {
             log.Printf("[AUTH-DEBUG] Failed to discover OIDC endpoints: %v", err)
@@ -680,7 +695,8 @@ func (a *AuthPlugin) fetchJWKS() (*JWKSet, error) {
     }
 
     a.debugLog("Fetching JWKS from: %s", a.endpoints.JwksUri)
-    resp, err := http.Get(a.endpoints.JwksUri)
+    client := a.getHTTPClient()
+    resp, err := client.Get(a.endpoints.JwksUri)
     if err != nil {
         return nil, err
     }
@@ -836,7 +852,8 @@ func (a *AuthPlugin) exchangeCodeForToken(code string) (*TokenResponse, error) {
     data.Set("client_id", a.config.ClientId)
     data.Set("client_secret", a.config.ClientSecret)
 
-    resp, err := http.PostForm(a.endpoints.TokenEndpoint, data)
+    client := a.getHTTPClient()
+    resp, err := client.PostForm(a.endpoints.TokenEndpoint, data)
     if err != nil {
         a.debugLog("HTTP request to token endpoint failed: %v", err)
         return nil, err
@@ -865,13 +882,27 @@ func (a *AuthPlugin) exchangeCodeForToken(code string) (*TokenResponse, error) {
     return &tokenResp, nil
 }
 
-func discoverOIDCEndpoints(issuerURL string, debug bool) (*OIDCEndpoints, error) {
+func discoverOIDCEndpoints(issuerURL string, debug bool, insecureTLS bool) (*OIDCEndpoints, error) {
     wellKnownURL := strings.TrimSuffix(issuerURL, "/") + "/.well-known/openid-configuration"
     if debug {
         log.Printf("[AUTH-DEBUG] Fetching OIDC configuration from: %s", wellKnownURL)
     }
     
-    resp, err := http.Get(wellKnownURL)
+    client := http.DefaultClient
+    if insecureTLS {
+        client = &http.Client{
+            Transport: &http.Transport{
+                TLSClientConfig: &tls.Config{
+                    InsecureSkipVerify: true,
+                },
+            },
+        }
+        if debug {
+            log.Printf("[AUTH-DEBUG] Using insecure TLS for OIDC discovery")
+        }
+    }
+    
+    resp, err := client.Get(wellKnownURL)
     if err != nil {
         if debug {
             log.Printf("[AUTH-DEBUG] Failed to fetch OIDC configuration: %v", err)
