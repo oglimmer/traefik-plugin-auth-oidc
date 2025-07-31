@@ -11,6 +11,7 @@ import (
     "encoding/json"
     "fmt"
     "io"
+    "io/ioutil"
     "log"
     "math/big"
     "net/http"
@@ -907,7 +908,7 @@ func discoverOIDCEndpoints(issuerURL string, debug bool, insecureTLS bool) (*OID
         if debug {
             log.Printf("[AUTH-DEBUG] Failed to fetch OIDC configuration: %v", err)
         }
-        return nil, err
+        return loadFallbackConfiguration(debug)
     }
     defer resp.Body.Close()
 
@@ -915,7 +916,7 @@ func discoverOIDCEndpoints(issuerURL string, debug bool, insecureTLS bool) (*OID
         if debug {
             log.Printf("[AUTH-DEBUG] OIDC configuration endpoint returned status: %d", resp.StatusCode)
         }
-        return nil, fmt.Errorf("failed to fetch OIDC configuration: %d", resp.StatusCode)
+        return loadFallbackConfiguration(debug)
     }
 
     body, err := io.ReadAll(resp.Body)
@@ -923,7 +924,7 @@ func discoverOIDCEndpoints(issuerURL string, debug bool, insecureTLS bool) (*OID
         if debug {
             log.Printf("[AUTH-DEBUG] Failed to read OIDC configuration response: %v", err)
         }
-        return nil, err
+        return loadFallbackConfiguration(debug)
     }
 
     if debug {
@@ -935,9 +936,39 @@ func discoverOIDCEndpoints(issuerURL string, debug bool, insecureTLS bool) (*OID
         if debug {
             log.Printf("[AUTH-DEBUG] Failed to unmarshal OIDC configuration: %v", err)
         }
-        return nil, err
+        return loadFallbackConfiguration(debug)
     }
 
+    return &endpoints, nil
+}
+
+func loadFallbackConfiguration(debug bool) (*OIDCEndpoints, error) {
+    if debug {
+        log.Printf("[AUTH-DEBUG] Loading fallback OIDC configuration from ./openid-configuration.json")
+    }
+    
+    body, err := ioutil.ReadFile("./openid-configuration.json")
+    if err != nil {
+        if debug {
+            log.Printf("[AUTH-DEBUG] Failed to read fallback configuration file: %v", err)
+        }
+        return nil, fmt.Errorf("failed to load fallback OIDC configuration: %v", err)
+    }
+    
+    var endpoints OIDCEndpoints
+    if err := json.Unmarshal(body, &endpoints); err != nil {
+        if debug {
+            log.Printf("[AUTH-DEBUG] Failed to unmarshal fallback OIDC configuration: %v", err)
+        }
+        return nil, fmt.Errorf("failed to parse fallback OIDC configuration: %v", err)
+    }
+    
+    if debug {
+        log.Printf("[AUTH-DEBUG] Fallback OIDC configuration loaded successfully")
+        log.Printf("[AUTH-DEBUG] Fallback endpoints - Auth: %s, Token: %s", 
+            endpoints.AuthorizationEndpoint, endpoints.TokenEndpoint)
+    }
+    
     return &endpoints, nil
 }
 
