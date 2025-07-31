@@ -72,11 +72,12 @@ func CreateConfig() *Config {
 }
 
 type AuthPlugin struct {
-    next      http.Handler
-    name      string
-    config    *Config
-    endpoints *OIDCEndpoints
-    sessions  *SessionStore
+    next         http.Handler
+    name         string
+    config       *Config
+    endpoints    *OIDCEndpoints
+    sessions     *SessionStore
+    callbackPath string
 }
 
 func (a *AuthPlugin) debugLog(format string, v ...interface{}) {
@@ -165,12 +166,27 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
             endpoints.AuthorizationEndpoint, endpoints.TokenEndpoint)
     }
 
+    // Extract callback path from RedirectUrl
+    redirectURL, err := url.Parse(config.RedirectUrl)
+    if err != nil {
+        return nil, fmt.Errorf("invalid redirectUrl: %v", err)
+    }
+    callbackPath := redirectURL.Path
+    if callbackPath == "" {
+        callbackPath = "/oauth2/callback"
+    }
+
+    if config.Debug {
+        log.Printf("[AUTH-DEBUG] Callback path extracted: %s", callbackPath)
+    }
+
     return &AuthPlugin{
-        next:      next,
-        name:      name,
-        config:    config,
-        endpoints: endpoints,
-        sessions:  NewSessionStore(),
+        next:         next,
+        name:         name,
+        config:       config,
+        endpoints:    endpoints,
+        sessions:     NewSessionStore(),
+        callbackPath: callbackPath,
     }, nil
 }
 
@@ -184,13 +200,15 @@ func (a *AuthPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
         return
     }
     
-    if req.URL.Path == "/oauth2/callback" {
+    if req.URL.Path == a.callbackPath {
         a.debugLog("Handling OAuth2 callback")
         a.handleCallback(rw, req)
         return
     }
     
-    if req.URL.Path == "/oauth2/logout" {
+    // Handle logout relative to callback path
+    logoutPath := strings.Replace(a.callbackPath, "/callback", "/logout", 1)
+    if req.URL.Path == logoutPath {
         a.debugLog("Handling logout request")
         a.handleLogout(rw, req)
         return
@@ -780,7 +798,9 @@ func (a *AuthPlugin) initiateOAuth2Flow(rw http.ResponseWriter, req *http.Reques
         MaxAge:   600,
     })
 
-    if !strings.HasPrefix(req.URL.Path, "/oauth2/") {
+    // Don't store original URL for OAuth2 related paths
+    callbackDir := strings.TrimSuffix(a.callbackPath, "/callback")
+    if !strings.HasPrefix(req.URL.Path, callbackDir+"/") {
         originalURL := req.URL.String()
         a.debugLog("Storing original URL: %s", originalURL)
         http.SetCookie(rw, &http.Cookie{

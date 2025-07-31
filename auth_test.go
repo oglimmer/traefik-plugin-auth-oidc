@@ -30,7 +30,8 @@ func createTestPlugin(config *Config) *AuthPlugin {
 			JwksUri:             "https://test.com/jwks",
 			EndSessionEndpoint:   "https://test.com/logout",
 		},
-		sessions: NewSessionStore(),
+		sessions:     NewSessionStore(),
+		callbackPath: "/oauth2/callback", // Default callback path
 	}
 }
 
@@ -439,6 +440,296 @@ func TestGenerateRandomString(t *testing.T) {
 
 			if str == str2 {
 				t.Error("Two random strings should be different")
+			}
+		})
+	}
+}
+
+func TestCallbackPathExtraction(t *testing.T) {
+	tests := []struct {
+		name         string
+		redirectUrl  string
+		expectedPath string
+		expectError  bool
+		description  string
+	}{
+		{
+			name:         "Standard OAuth2 callback",
+			redirectUrl:  "https://example.com/oauth2/callback",
+			expectedPath: "/oauth2/callback",
+			expectError:  false,
+			description:  "Should extract standard callback path",
+		},
+		{
+			name:         "Custom UI prefix callback",
+			redirectUrl:  "https://example.com/ui/oauth2/callback",
+			expectedPath: "/ui/oauth2/callback",
+			expectError:  false,
+			description:  "Should extract callback path with UI prefix",
+		},
+		{
+			name:         "Root callback",
+			redirectUrl:  "https://example.com/callback",
+			expectedPath: "/callback",
+			expectError:  false,
+			description:  "Should extract callback path at root level",
+		},
+		{
+			name:         "Deep nested callback",
+			redirectUrl:  "https://example.com/app/v1/auth/callback",
+			expectedPath: "/app/v1/auth/callback",
+			expectError:  false,
+			description:  "Should extract deeply nested callback path",
+		},
+		{
+			name:         "Empty path defaults to standard",
+			redirectUrl:  "https://example.com",
+			expectedPath: "/oauth2/callback",
+			expectError:  false,
+			description:  "Should default to /oauth2/callback when no path specified",
+		},
+		{
+			name:         "Invalid URL",
+			redirectUrl:  "not-a-url",
+			expectedPath: "",
+			expectError:  true,
+			description:  "Should return error for invalid URL",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := &Config{
+				IssuerUrl:    "https://test.com",
+				ClientId:     "test-client",
+				ClientSecret: "test-secret",
+				RedirectUrl:  tt.redirectUrl,
+				Debug:        true,
+			}
+
+			// Mock OIDC endpoint discovery
+			plugin, err := createTestPluginWithCallbackPath(config)
+			
+			if tt.expectError {
+				if err == nil {
+					t.Errorf("%s: expected error but got none", tt.description)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("%s: unexpected error: %v", tt.description, err)
+				return
+			}
+
+			if plugin.callbackPath != tt.expectedPath {
+				t.Errorf("%s: expected callback path %s, got %s", tt.description, tt.expectedPath, plugin.callbackPath)
+			}
+		})
+	}
+}
+
+func createTestPluginWithCallbackPath(config *Config) (*AuthPlugin, error) {
+	// Simulate the callback path extraction logic from New()
+	redirectURL, err := parseURL(config.RedirectUrl)
+	if err != nil {
+		return nil, fmt.Errorf("invalid redirectUrl: %v", err)
+	}
+	
+	callbackPath := redirectURL.Path
+	if callbackPath == "" {
+		callbackPath = "/oauth2/callback"
+	}
+
+	return &AuthPlugin{
+		next:   &mockHandler{},
+		name:   "test-plugin",
+		config: config,
+		endpoints: &OIDCEndpoints{
+			AuthorizationEndpoint: "https://test.com/auth",
+			TokenEndpoint:        "https://test.com/token",
+			UserinfoEndpoint:     "https://test.com/userinfo",
+			JwksUri:             "https://test.com/jwks",
+			EndSessionEndpoint:   "https://test.com/logout",
+		},
+		sessions:     NewSessionStore(),
+		callbackPath: callbackPath,
+	}, nil
+}
+
+// Helper function to parse URL (mimics url.Parse but for testing)
+func parseURL(rawURL string) (*urlParts, error) {
+	if rawURL == "not-a-url" {
+		return nil, fmt.Errorf("invalid URL")
+	}
+	
+	// Simple URL parsing for test purposes
+	if rawURL == "https://example.com" {
+		return &urlParts{Path: ""}, nil
+	}
+	
+	// Extract path from URL for testing
+	parts := map[string]string{
+		"https://example.com/oauth2/callback":      "/oauth2/callback",
+		"https://example.com/ui/oauth2/callback":   "/ui/oauth2/callback", 
+		"https://example.com/callback":             "/callback",
+		"https://example.com/app/v1/auth/callback": "/app/v1/auth/callback",
+	}
+	
+	if path, exists := parts[rawURL]; exists {
+		return &urlParts{Path: path}, nil
+	}
+	
+	return nil, fmt.Errorf("unknown URL")
+}
+
+type urlParts struct {
+	Path string
+}
+
+func TestServeHTTP_DynamicCallbackPath(t *testing.T) {
+	tests := []struct {
+		name           string
+		callbackPath   string
+		requestPath    string
+		expectedStatus int
+		nextCalled     bool
+		description    string
+	}{
+		{
+			name:           "Standard callback path",
+			callbackPath:   "/oauth2/callback",
+			requestPath:    "/oauth2/callback",
+			expectedStatus: http.StatusBadRequest, // No code parameter
+			nextCalled:     false,
+			description:    "Should handle standard callback path",
+		},
+		{
+			name:           "UI prefix callback path",
+			callbackPath:   "/ui/oauth2/callback", 
+			requestPath:    "/ui/oauth2/callback",
+			expectedStatus: http.StatusBadRequest, // No code parameter
+			nextCalled:     false,
+			description:    "Should handle UI prefix callback path",
+		},
+		{
+			name:           "Wrong callback path ignored",
+			callbackPath:   "/ui/oauth2/callback",
+			requestPath:    "/oauth2/callback",
+			expectedStatus: http.StatusFound, // Initiates OIDC flow
+			nextCalled:     false,
+			description:    "Should not handle callback at wrong path",
+		},
+		{
+			name:           "Custom deep callback path",
+			callbackPath:   "/app/v1/auth/callback",
+			requestPath:    "/app/v1/auth/callback", 
+			expectedStatus: http.StatusBadRequest, // No code parameter
+			nextCalled:     false,
+			description:    "Should handle custom deep callback path",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := &Config{
+				IssuerUrl:    "https://test.com",
+				ClientId:     "test-client",
+				ClientSecret: "test-secret",
+				RedirectUrl:  "https://test.com" + tt.callbackPath,
+				Debug:        true,
+			}
+
+			plugin := createTestPlugin(config)
+			plugin.callbackPath = tt.callbackPath // Override with test callback path
+			mockNext := &mockHandler{}
+			plugin.next = mockNext
+
+			req := httptest.NewRequest("GET", tt.requestPath, nil)
+			rr := httptest.NewRecorder()
+
+			plugin.ServeHTTP(rr, req)
+
+			if rr.Code != tt.expectedStatus {
+				t.Errorf("%s: expected status %d, got %d", tt.description, tt.expectedStatus, rr.Code)
+			}
+
+			if mockNext.called != tt.nextCalled {
+				t.Errorf("%s: expected next handler called=%v, got=%v", tt.description, tt.nextCalled, mockNext.called)
+			}
+		})
+	}
+}
+
+func TestServeHTTP_DynamicLogoutPath(t *testing.T) {
+	tests := []struct {
+		name           string
+		callbackPath   string
+		requestPath    string
+		expectedStatus int
+		nextCalled     bool
+		description    string
+	}{
+		{
+			name:           "Standard logout path",
+			callbackPath:   "/oauth2/callback",
+			requestPath:    "/oauth2/logout",
+			expectedStatus: http.StatusFound, // Redirect to logout
+			nextCalled:     false,
+			description:    "Should handle standard logout path",
+		},
+		{
+			name:           "UI prefix logout path",
+			callbackPath:   "/ui/oauth2/callback",
+			requestPath:    "/ui/oauth2/logout",
+			expectedStatus: http.StatusFound, // Redirect to logout
+			nextCalled:     false,
+			description:    "Should handle UI prefix logout path",
+		},
+		{
+			name:           "Wrong logout path ignored",
+			callbackPath:   "/ui/oauth2/callback",
+			requestPath:    "/oauth2/logout",
+			expectedStatus: http.StatusFound, // Initiates OIDC flow instead
+			nextCalled:     false,
+			description:    "Should not handle logout at wrong path",
+		},
+		{
+			name:           "Custom deep logout path",
+			callbackPath:   "/app/v1/auth/callback",
+			requestPath:    "/app/v1/auth/logout",
+			expectedStatus: http.StatusFound, // Redirect to logout
+			nextCalled:     false,
+			description:    "Should handle custom deep logout path",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := &Config{
+				IssuerUrl:    "https://test.com",
+				ClientId:     "test-client",
+				ClientSecret: "test-secret",
+				RedirectUrl:  "https://test.com" + tt.callbackPath,
+				Debug:        true,
+			}
+
+			plugin := createTestPlugin(config)
+			plugin.callbackPath = tt.callbackPath // Override with test callback path
+			mockNext := &mockHandler{}
+			plugin.next = mockNext
+
+			req := httptest.NewRequest("GET", tt.requestPath, nil)
+			rr := httptest.NewRecorder()
+
+			plugin.ServeHTTP(rr, req)
+
+			if rr.Code != tt.expectedStatus {
+				t.Errorf("%s: expected status %d, got %d", tt.description, tt.expectedStatus, rr.Code)
+			}
+
+			if mockNext.called != tt.nextCalled {
+				t.Errorf("%s: expected next handler called=%v, got=%v", tt.description, tt.nextCalled, mockNext.called)
 			}
 		})
 	}

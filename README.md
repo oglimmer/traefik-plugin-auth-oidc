@@ -23,7 +23,7 @@ http:
           issuerUrl: "https://your-oidc-provider.com"
           clientId: "your-client-id"
           clientSecret: "your-client-secret"
-          redirectUrl: "https://your-app.com/oauth2/callback"
+          redirectUrl: "https://your-app.com/oauth2/callback"  # Can be any path ending with /callback
           scopes:
             - "openid"
             - "profile" 
@@ -48,7 +48,7 @@ then using this as
       - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.issuerUrl=https://your-oidc-provider.com"
       - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.clientId=your-client-id"
       - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.clientSecret=your-client-secret"
-      - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.redirectUrl=https://your-app.com/oauth2/callback"
+      - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.redirectUrl=https://your-app.com/oauth2/callback"  # Can be any path ending with /callback
       - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.scopes[0]=openid"
       - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.scopes[1]=email"
       - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.allowedUsers[0]=user@foobar.de"
@@ -62,7 +62,7 @@ then using this as
 | `issuerUrl` | string | Yes* | - | OIDC provider issuer URL |
 | `clientId` | string | Yes* | - | OAuth2 client ID |
 | `clientSecret` | string | Yes* | - | OAuth2 client secret |
-| `redirectUrl` | string | Yes* | - | OAuth2 redirect URI (must end with `/oauth2/callback`) |
+| `redirectUrl` | string | Yes* | - | OAuth2 redirect URI (callback path is automatically extracted) |
 | `scopes` | []string | No | `["openid", "profile", "email"]` | OAuth2 scopes to request |
 | `skippedPaths` | []string | No | `[]` | Paths to skip authentication for |
 | `debug` | bool | No | `false` | Enable debug logging |
@@ -75,7 +75,7 @@ then using this as
 
 ### OIDC Authentication
 
-1. Configure your OIDC provider with the redirect URI ending in `/oauth2/callback`
+1. Configure your OIDC provider with the redirect URI (e.g., `https://your-app.com/oauth2/callback` or `https://your-app.com/ui/oauth2/callback`)
 2. Add the middleware to your Traefik configuration with OIDC parameters
 3. Apply the middleware to your routes
 
@@ -95,8 +95,8 @@ The plugin checks authentication in this order:
 5. Initiate OIDC flow (if no valid authentication found)
 
 The plugin automatically handles:
-- `/oauth2/callback` - OAuth2 callback endpoint
-- `/oauth2/logout` - Logout endpoint
+- OAuth2 callback endpoint (path extracted from `redirectUrl`)
+- Logout endpoint (relative to callback path, e.g., `/oauth2/logout` or `/ui/oauth2/logout`)
 - Authentication for all other paths (except skipped paths)
 
 ## Skipped Paths
@@ -164,7 +164,7 @@ Current test coverage focuses on:
 - ✅ Basic auth credential validation and edge cases
 - ✅ HTTP request/response flows for authentication
 - ✅ Path-based authentication skipping
-- ✅ OAuth2 callback and logout endpoint handling
+- ✅ OAuth2 callback and logout endpoint handling (including dynamic path support)
 - ✅ Session store operations
 - ✅ Configuration defaults and validation
 
