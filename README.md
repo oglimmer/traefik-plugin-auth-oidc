@@ -33,6 +33,7 @@ http:
           debug: false
           basicAuth: "user:password"  # Optional: enables basic auth as alternative
           insecureTLS: false  # Optional: disable TLS certificate verification
+          defaultReply: "oidc"  # Optional: "oidc" (default) or "basic" - response when auth fails
 ```
 
 or as CLI
@@ -56,6 +57,7 @@ then using this as
       - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.allowedUsers[0]=user@foobar.de"
       - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.basicAuth=user:password"
       - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.insecureTLS=true"
+      - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.defaultReply=basic"
 ```
 
 ### Configuration Parameters
@@ -72,6 +74,7 @@ then using this as
 | `allowedUsers` | []string | No | `[]` | List of allowed user emails for OIDC auth |
 | `basicAuth` | string | No | - | Basic auth credentials in format "user:password" |
 | `insecureTLS` | bool | No | `false` | Disable TLS certificate hostname verification |
+| `defaultReply` | string | No | `"oidc"` | Authentication failure response: `"oidc"` (redirect to OIDC) or `"basic"` (WWW-Authenticate header) |
 
 *Required only when `basicAuth` is not configured
 
@@ -96,12 +99,34 @@ The plugin checks authentication in this order:
 2. OAuth2 callback and logout endpoints
 3. **Basic Authentication** (if configured and provided)
 4. OIDC token validation (cookies/session)
-5. Initiate OIDC flow (if no valid authentication found)
+5. Handle authentication failure based on `defaultReply` setting:
+   - `"oidc"` (default): Initiate OIDC flow with redirect to authorization server
+   - `"basic"`: Return 401 with `WWW-Authenticate: Basic` header
 
 The plugin automatically handles:
 - OAuth2 callback endpoint (path extracted from `redirectUrl`)
 - Logout endpoint (relative to callback path, e.g., `/oauth2/logout` or `/ui/oauth2/logout`)
 - Authentication for all other paths (except skipped paths)
+
+### Authentication Failure Responses
+
+The `defaultReply` parameter controls how the plugin responds when authentication fails:
+
+#### OIDC Mode (`defaultReply: "oidc"` - Default)
+- Redirects users to the OIDC provider's login page
+- Best for web applications with browser-based users
+- Provides seamless single sign-on experience
+- Users are redirected back after successful authentication
+
+#### Basic Auth Mode (`defaultReply: "basic"`)
+- Returns HTTP 401 with `WWW-Authenticate: Basic realm="Authentication Required"` header
+- Best for API clients, CLI tools, or applications that prefer basic authentication prompts
+- Client applications will typically show a username/password dialog
+- Compatible with curl, Postman, and other HTTP clients that support basic auth
+
+**Example use cases:**
+- Use `"oidc"` for web dashboards, user-facing applications
+- Use `"basic"` for API endpoints, monitoring tools, or when you want to force basic auth dialogs
 
 ## Skipped Paths
 
@@ -199,6 +224,7 @@ Current test coverage focuses on:
 - ✅ OAuth2 callback and logout endpoint handling (including dynamic path support)
 - ✅ Session store operations
 - ✅ Configuration defaults and validation
+- ✅ Default reply behavior (OIDC vs Basic auth responses)
 
 The tests achieve comprehensive coverage of authentication flows and security-critical functionality.
 

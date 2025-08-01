@@ -376,6 +376,10 @@ func TestCreateConfig(t *testing.T) {
 	if config.BasicAuth != "" {
 		t.Errorf("Expected empty BasicAuth, got %s", config.BasicAuth)
 	}
+
+	if config.DefaultReply != "oidc" {
+		t.Errorf("Expected DefaultReply to be 'oidc', got %s", config.DefaultReply)
+	}
 }
 
 func TestSessionStore(t *testing.T) {
@@ -652,6 +656,128 @@ func TestServeHTTP_DynamicCallbackPath(t *testing.T) {
 
 			if rr.Code != tt.expectedStatus {
 				t.Errorf("%s: expected status %d, got %d", tt.description, tt.expectedStatus, rr.Code)
+			}
+
+			if mockNext.called != tt.nextCalled {
+				t.Errorf("%s: expected next handler called=%v, got=%v", tt.description, tt.nextCalled, mockNext.called)
+			}
+		})
+	}
+}
+
+func TestDefaultReplyBehavior(t *testing.T) {
+	tests := []struct {
+		name           string
+		defaultReply   string
+		hasBasicAuth   bool
+		authHeader     string
+		expectedStatus int
+		expectWWWAuth  bool
+		nextCalled     bool
+		description    string
+	}{
+		{
+			name:           "DefaultReply OIDC - no auth initiates OIDC flow",
+			defaultReply:   "oidc",
+			hasBasicAuth:   false,
+			authHeader:     "",
+			expectedStatus: http.StatusFound,
+			expectWWWAuth:  false,
+			nextCalled:     false,
+			description:    "Should initiate OIDC flow when defaultReply is oidc",
+		},
+		{
+			name:           "DefaultReply basic - no auth returns WWW-Authenticate",
+			defaultReply:   "basic",
+			hasBasicAuth:   false,
+			authHeader:     "",
+			expectedStatus: http.StatusUnauthorized,
+			expectWWWAuth:  true,
+			nextCalled:     false,
+			description:    "Should return WWW-Authenticate when defaultReply is basic",
+		},
+		{
+			name:           "DefaultReply basic - valid basic auth allows access",
+			defaultReply:   "basic",
+			hasBasicAuth:   true,
+			authHeader:     "Basic " + base64.StdEncoding.EncodeToString([]byte("admin:secret")),
+			expectedStatus: http.StatusOK,
+			expectWWWAuth:  false,
+			nextCalled:     true,
+			description:    "Should allow access with valid basic auth regardless of defaultReply",
+		},
+		{
+			name:           "DefaultReply basic - invalid basic auth returns WWW-Authenticate",
+			defaultReply:   "basic",
+			hasBasicAuth:   true,
+			authHeader:     "Basic " + base64.StdEncoding.EncodeToString([]byte("wrong:credentials")),
+			expectedStatus: http.StatusUnauthorized,
+			expectWWWAuth:  true,
+			nextCalled:     false,
+			description:    "Should return WWW-Authenticate with invalid basic auth when defaultReply is basic",
+		},
+		{
+			name:           "DefaultReply OIDC - invalid basic auth initiates OIDC flow",
+			defaultReply:   "oidc",
+			hasBasicAuth:   true,
+			authHeader:     "Basic " + base64.StdEncoding.EncodeToString([]byte("wrong:credentials")),
+			expectedStatus: http.StatusFound,
+			expectWWWAuth:  false,
+			nextCalled:     false,
+			description:    "Should initiate OIDC flow with invalid basic auth when defaultReply is oidc",
+		},
+		{
+			name:           "Empty defaultReply defaults to OIDC behavior",
+			defaultReply:   "",
+			hasBasicAuth:   false,
+			authHeader:     "",
+			expectedStatus: http.StatusFound,
+			expectWWWAuth:  false,
+			nextCalled:     false,
+			description:    "Should default to OIDC behavior when defaultReply is empty",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := &Config{
+				IssuerUrl:    "https://test.com",
+				ClientId:     "test-client",
+				ClientSecret: "test-secret",
+				RedirectUrl:  "https://test.com/callback",
+				DefaultReply: tt.defaultReply,
+				Debug:        true,
+			}
+
+			if tt.hasBasicAuth {
+				config.BasicAuth = "admin:secret"
+			}
+
+			mockNext := &mockHandler{}
+			plugin := createTestPlugin(config)
+			plugin.next = mockNext
+
+			req := httptest.NewRequest("GET", "/protected", nil)
+			if tt.authHeader != "" {
+				req.Header.Set("Authorization", tt.authHeader)
+			}
+
+			rr := httptest.NewRecorder()
+			plugin.ServeHTTP(rr, req)
+
+			if rr.Code != tt.expectedStatus {
+				t.Errorf("%s: expected status %d, got %d", tt.description, tt.expectedStatus, rr.Code)
+			}
+
+			wwwAuthHeader := rr.Header().Get("WWW-Authenticate")
+			if tt.expectWWWAuth && wwwAuthHeader == "" {
+				t.Errorf("%s: expected WWW-Authenticate header but got none", tt.description)
+			} else if !tt.expectWWWAuth && wwwAuthHeader != "" {
+				t.Errorf("%s: unexpected WWW-Authenticate header: %s", tt.description, wwwAuthHeader)
+			}
+
+			if tt.expectWWWAuth && wwwAuthHeader != "Basic realm=\"Authentication Required\"" {
+				t.Errorf("%s: expected WWW-Authenticate 'Basic realm=\"Authentication Required\"', got '%s'", tt.description, wwwAuthHeader)
 			}
 
 			if mockNext.called != tt.nextCalled {

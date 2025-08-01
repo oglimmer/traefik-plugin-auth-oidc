@@ -32,6 +32,7 @@ type Config struct {
     AllowedUsers  []string `json:"allowedUsers"`
     BasicAuth     string   `json:"basicAuth"`
     InsecureTLS   bool     `json:"insecureTLS"`
+    DefaultReply  string   `json:"defaultReply"`
 }
 
 type JWTHeader struct {
@@ -71,6 +72,7 @@ func CreateConfig() *Config {
         Scopes: []string{"openid", "profile", "email"},
         SkippedPaths: []string{},
         AllowedUsers: []string{},
+        DefaultReply: "oidc",
     }
 }
 
@@ -243,7 +245,20 @@ func (a *AuthPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
         return
     }
 
-    a.debugLog("No valid authentication, initiating OAuth2 flow")
+    a.debugLog("No valid authentication, handling failure with defaultReply: %s", a.config.DefaultReply)
+    a.handleAuthFailure(rw, req)
+}
+
+func (a *AuthPlugin) handleAuthFailure(rw http.ResponseWriter, req *http.Request) {
+    if a.config.DefaultReply == "basic" {
+        a.debugLog("Sending WWW-Authenticate header for basic auth")
+        rw.Header().Set("WWW-Authenticate", "Basic realm=\"Authentication Required\"")
+        http.Error(rw, "Authentication required", http.StatusUnauthorized)
+        return
+    }
+    
+    // Default to OIDC flow
+    a.debugLog("Initiating OAuth2 flow")
     a.initiateOAuth2Flow(rw, req)
 }
 
