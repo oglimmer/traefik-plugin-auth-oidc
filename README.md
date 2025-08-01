@@ -32,6 +32,8 @@ http:
             - "email"
           skippedPaths: []
           debug: false
+          allowedUsers: []  # Optional: list of allowed user emails
+          allowedGroups: []  # Optional: list of allowed groups from specialGroupClaim
           basicAuth: "user:password"  # Optional: enables basic auth as alternative
           insecureTLS: false  # Optional: disable TLS certificate verification
           defaultReply: "oidc"  # Optional: "oidc" (default) or "basic" - response when auth fails
@@ -57,6 +59,7 @@ then using this as
       - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.scopes[0]=openid"
       - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.scopes[1]=email"
       - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.allowedUsers[0]=user@foobar.de"
+      - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.allowedGroups[0]=admin-group"
       - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.basicAuth=user:password"
       - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.insecureTLS=true"
       - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.defaultReply=basic"
@@ -75,6 +78,7 @@ then using this as
 | `skippedPaths` | []string | No | `[]` | Paths to skip authentication for |
 | `debug` | bool | No | `false` | Enable debug logging |
 | `allowedUsers` | []string | No | `[]` | List of allowed user emails for OIDC auth |
+| `allowedGroups` | []string | No | `[]` | List of allowed groups from JWT specialGroupClaim |
 | `basicAuth` | string | No | - | Basic auth credentials in format "user:password" |
 | `insecureTLS` | bool | No | `false` | Disable TLS certificate hostname verification |
 | `defaultReply` | string | No | `"oidc"` | Authentication failure response: `"oidc"` (redirect to OIDC) or `"basic"` (WWW-Authenticate header) |
@@ -111,6 +115,35 @@ The plugin automatically handles:
 - OAuth2 callback endpoint (path extracted from `redirectUrl`)
 - Logout endpoint (relative to callback path, e.g., `/oauth2/logout` or `/ui/oauth2/logout`)
 - Authentication for all other paths (except skipped paths)
+
+### User and Group Authorization
+
+The plugin supports fine-grained access control through two parameters:
+
+- **`allowedUsers`**: List of email addresses that are allowed access
+- **`allowedGroups`**: List of group names from the JWT `specialGroupClaim` field that are allowed access
+
+**Authorization Logic:**
+- If neither `allowedUsers` nor `allowedGroups` are configured, all authenticated users are allowed access
+- If either parameter is configured, the user must match at least one condition:
+  - Their email address appears in the `allowedUsers` list, OR
+  - At least one of their groups (from `specialGroupClaim`) appears in the `allowedGroups` list
+- Access is granted if either condition is satisfied (OR logic)
+
+**Example Configuration:**
+```yaml
+allowedUsers:
+  - "admin@company.com" 
+  - "user@company.com"
+allowedGroups:
+  - "admin-group"
+  - "developer-team"
+```
+
+In this example, access is granted to:
+- Users with email `admin@company.com` or `user@company.com` 
+- Any user belonging to the `admin-group` or `developer-team` groups
+- Users who meet both conditions (email AND group membership)
 
 ### Authentication Failure Responses
 

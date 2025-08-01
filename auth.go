@@ -33,6 +33,7 @@ type Config struct {
     SkippedPaths   []string `json:"skippedPaths"`
     Debug          bool     `json:"debug"`
     AllowedUsers   []string `json:"allowedUsers"`
+    AllowedGroups  []string `json:"allowedGroups"`
     BasicAuth      string   `json:"basicAuth"`
     InsecureTLS    bool     `json:"insecureTLS"`
     DefaultReply   string   `json:"defaultReply"`
@@ -57,6 +58,7 @@ type JWTClaims struct {
     EmailVerified bool   `json:"email_verified,omitempty"`
     Name          string `json:"name,omitempty"`
     PreferredUsername string `json:"preferred_username,omitempty"`
+    SpecialGroupClaim []string `json:"specialGroupClaim,omitempty"`
 }
 
 type JWK struct {
@@ -76,6 +78,7 @@ func CreateConfig() *Config {
         Scopes: []string{"openid", "profile", "email"},
         SkippedPaths: []string{},
         AllowedUsers: []string{},
+        AllowedGroups: []string{},
         DefaultReply: "oidc",
         SessionBackend: "in-memory",
     }
@@ -883,8 +886,21 @@ func (a *AuthPlugin) verifyJWT(tokenString string) (*JWTClaims, error) {
 
     a.debugLog("JWT Claims - Subject: %s, Email: %s, Name: %s, Username: %s, Issuer: %s", 
         claims.Sub, claims.Email, claims.Name, claims.PreferredUsername, claims.Iss)
-    a.debugLog("JWT Claims - Expires: %d, Issued: %d, Email Verified: %t", 
-        claims.Exp, claims.Iat, claims.EmailVerified)
+    a.debugLog("JWT Claims - Expires: %d, Issued: %d, Email Verified: %t, Special Groups: %v", 
+        claims.Exp, claims.Iat, claims.EmailVerified, claims.SpecialGroupClaim)
+
+    // Print the complete decoded JWT when debug is enabled
+    decodedJWT := map[string]interface{}{
+        "header": map[string]interface{}{
+            "alg": header.Alg,
+            "typ": header.Typ,
+            "kid": header.Kid,
+        },
+        "payload": claims,
+    }
+    if decodedJWTJSON, err := json.MarshalIndent(decodedJWT, "", "  "); err == nil {
+        a.debugLog("Decoded JWT:\n%s", string(decodedJWTJSON))
+    }
 
     // Validate claims after signature verification
     if time.Now().Unix() > claims.Exp {
@@ -1023,24 +1039,36 @@ func (a *AuthPlugin) jwkToRSAPublicKey(jwk JWK) (*rsa.PublicKey, error) {
 }
 
 func (a *AuthPlugin) isUserAllowed(claims *JWTClaims) bool {
-    if len(a.config.AllowedUsers) == 0 {
-        a.debugLog("No user restrictions configured, allowing access")
+    // If no restrictions are configured, allow access
+    if len(a.config.AllowedUsers) == 0 && len(a.config.AllowedGroups) == 0 {
+        a.debugLog("No user or group restrictions configured, allowing access")
         return true
     }
 
-    if claims.Email == "" {
-        a.debugLog("No email found in JWT claims, access denied")
-        return false
-    }
-
-    for _, allowedEmail := range a.config.AllowedUsers {
-        if claims.Email == allowedEmail {
-            a.debugLog("User allowed: email %s matches allowed list", claims.Email)
-            return true
+    // Check allowed users first
+    if len(a.config.AllowedUsers) > 0 && claims.Email != "" {
+        for _, allowedEmail := range a.config.AllowedUsers {
+            if claims.Email == allowedEmail {
+                a.debugLog("User allowed: email %s matches allowed list", claims.Email)
+                return true
+            }
         }
     }
 
-    a.debugLog("User email %s not in allowed list: %v", claims.Email, a.config.AllowedUsers)
+    // Check allowed groups
+    if len(a.config.AllowedGroups) > 0 && len(claims.SpecialGroupClaim) > 0 {
+        for _, userGroup := range claims.SpecialGroupClaim {
+            for _, allowedGroup := range a.config.AllowedGroups {
+                if userGroup == allowedGroup {
+                    a.debugLog("User allowed: group %s matches allowed groups", userGroup)
+                    return true
+                }
+            }
+        }
+    }
+
+    a.debugLog("User access denied - email %s not in allowed users %v and groups %v not in allowed groups %v", 
+        claims.Email, a.config.AllowedUsers, claims.SpecialGroupClaim, a.config.AllowedGroups)
     return false
 }
 
