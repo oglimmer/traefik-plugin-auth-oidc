@@ -30,7 +30,7 @@ func createTestPlugin(config *Config) *AuthPlugin {
 			JwksUri:             "https://test.com/jwks",
 			EndSessionEndpoint:   "https://test.com/logout",
 		},
-		sessions:     NewSessionStore(),
+		sessions:     NewInMemorySessionStore(),
 		callbackPath: "/oauth2/callback", // Default callback path
 	}
 }
@@ -383,7 +383,7 @@ func TestCreateConfig(t *testing.T) {
 }
 
 func TestSessionStore(t *testing.T) {
-	store := NewSessionStore()
+	store := NewInMemorySessionStore()
 
 	sessionID := "test-session-123"
 	testData := map[string]interface{}{
@@ -393,9 +393,15 @@ func TestSessionStore(t *testing.T) {
 	}
 
 	// Test Set and Get
-	store.Set(sessionID, testData)
+	err := store.Set(sessionID, testData)
+	if err != nil {
+		t.Fatalf("Failed to set session: %v", err)
+	}
 	
-	retrievedData, exists := store.Get(sessionID)
+	retrievedData, exists, err := store.Get(sessionID)
+	if err != nil {
+		t.Fatalf("Failed to get session: %v", err)
+	}
 	if !exists {
 		t.Fatal("Session should exist after being set")
 	}
@@ -409,14 +415,23 @@ func TestSessionStore(t *testing.T) {
 	}
 
 	// Test non-existent session
-	_, exists = store.Get("non-existent")
+	_, exists, err = store.Get("non-existent")
+	if err != nil {
+		t.Fatalf("Failed to get non-existent session: %v", err)
+	}
 	if exists {
 		t.Error("Non-existent session should not exist")
 	}
 
 	// Test Delete
-	store.Delete(sessionID)
-	_, exists = store.Get(sessionID)
+	err = store.Delete(sessionID)
+	if err != nil {
+		t.Fatalf("Failed to delete session: %v", err)
+	}
+	_, exists, err = store.Get(sessionID)
+	if err != nil {
+		t.Fatalf("Failed to get session after deletion: %v", err)
+	}
 	if exists {
 		t.Error("Session should not exist after deletion")
 	}
@@ -556,7 +571,7 @@ func createTestPluginWithCallbackPath(config *Config) (*AuthPlugin, error) {
 			JwksUri:             "https://test.com/jwks",
 			EndSessionEndpoint:   "https://test.com/logout",
 		},
-		sessions:     NewSessionStore(),
+		sessions:     NewInMemorySessionStore(),
 		callbackPath: callbackPath,
 	}, nil
 }

@@ -7,6 +7,7 @@ A Traefik middleware plugin that provides OIDC (OpenID Connect) authentication w
 - OIDC authentication flow with automatic endpoint discovery
 - **Fallback OIDC configuration** - uses `./openid-configuration.json` when OIDC discovery fails
 - Optional Basic Authentication support as an alternative to OIDC
+- Configurable session storage: in-memory (default) or Redis
 - Cookie-based session management with fallback token storage
 - Configurable redirect URLs and scopes
 - Logout support with OIDC provider integration
@@ -34,6 +35,7 @@ http:
           basicAuth: "user:password"  # Optional: enables basic auth as alternative
           insecureTLS: false  # Optional: disable TLS certificate verification
           defaultReply: "oidc"  # Optional: "oidc" (default) or "basic" - response when auth fails
+          sessionBackend: "in-memory"  # Optional: "in-memory" (default) or "redis:REDIS_URL"
 ```
 
 or as CLI
@@ -58,6 +60,7 @@ then using this as
       - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.basicAuth=user:password"
       - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.insecureTLS=true"
       - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.defaultReply=basic"
+      - "traefik.http.middlewares.siteauth.plugin.traefikpluginauth.sessionBackend=redis:http://redis:8080"
 ```
 
 ### Configuration Parameters
@@ -75,6 +78,7 @@ then using this as
 | `basicAuth` | string | No | - | Basic auth credentials in format "user:password" |
 | `insecureTLS` | bool | No | `false` | Disable TLS certificate hostname verification |
 | `defaultReply` | string | No | `"oidc"` | Authentication failure response: `"oidc"` (redirect to OIDC) or `"basic"` (WWW-Authenticate header) |
+| `sessionBackend` | string | No | `"in-memory"` | Session storage backend: `"in-memory"` or `"redis:REDIS_URL"` |
 
 *Required only when `basicAuth` is not configured
 
@@ -145,11 +149,43 @@ Paths are matched using prefix matching, so `/health` will match `/health`, `/he
 
 ## Session Management
 
+The plugin supports configurable session storage backends through the `sessionBackend` parameter:
+
+### In-Memory Session Storage (Default)
+```yaml
+sessionBackend: "in-memory"  # or omit for default
+```
+- Sessions stored in memory within the plugin instance
+- Fast access, no external dependencies
+- Sessions are lost on plugin restart
+- Suitable for single-instance deployments
+
+### Redis Session Storage
+```yaml
+sessionBackend: "redis:http://redis-server:8080"
+```
+- Sessions stored in external Redis server via HTTP REST API
+- Persistent across plugin restarts
+- Supports load-balanced/multi-instance deployments
+- Requires Redis server with HTTP interface
+
+### Session Structure
+
 The plugin uses a dual-layer session management approach:
-1. In-memory session store with session ID cookies
-2. Fallback to base64-encoded token cookies
+1. Primary session store (in-memory or Redis) with session ID cookies
+2. Fallback to base64-encoded token cookies for compatibility
 
 Sessions automatically expire based on the token expiration time from the OIDC provider.
+
+### Redis Configuration
+
+When using Redis session backend:
+- The Redis URL should point to a Redis server with HTTP REST API support
+- The plugin makes HTTP calls to Redis using standard REST endpoints:
+  - `PUT /session:SESSION_ID` - Store session data
+  - `GET /session:SESSION_ID` - Retrieve session data  
+  - `DELETE /session:SESSION_ID` - Delete session data
+- Session data is stored as JSON in Redis with `session:` key prefix
 
 ## Fallback Configuration
 

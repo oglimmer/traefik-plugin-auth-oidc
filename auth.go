@@ -1,6 +1,7 @@
 package traefik_plugin_auth
 
 import (
+    "bufio"
     "context"
     "crypto"
     "crypto/rand"
@@ -14,25 +15,28 @@ import (
     "io/ioutil"
     "log"
     "math/big"
+    "net"
     "net/http"
     "net/url"
+    "strconv"
     "strings"
     "sync"
     "time"
 )
 
 type Config struct {
-    IssuerUrl     string   `json:"issuerUrl"`
-    ClientId      string   `json:"clientId"`
-    ClientSecret  string   `json:"clientSecret"`
-    RedirectUrl   string   `json:"redirectUrl"`
-    Scopes        []string `json:"scopes"`
-    SkippedPaths  []string `json:"skippedPaths"`
-    Debug         bool     `json:"debug"`
-    AllowedUsers  []string `json:"allowedUsers"`
-    BasicAuth     string   `json:"basicAuth"`
-    InsecureTLS   bool     `json:"insecureTLS"`
-    DefaultReply  string   `json:"defaultReply"`
+    IssuerUrl      string   `json:"issuerUrl"`
+    ClientId       string   `json:"clientId"`
+    ClientSecret   string   `json:"clientSecret"`
+    RedirectUrl    string   `json:"redirectUrl"`
+    Scopes         []string `json:"scopes"`
+    SkippedPaths   []string `json:"skippedPaths"`
+    Debug          bool     `json:"debug"`
+    AllowedUsers   []string `json:"allowedUsers"`
+    BasicAuth      string   `json:"basicAuth"`
+    InsecureTLS    bool     `json:"insecureTLS"`
+    DefaultReply   string   `json:"defaultReply"`
+    SessionBackend string   `json:"sessionBackend"`
 }
 
 type JWTHeader struct {
@@ -73,6 +77,7 @@ func CreateConfig() *Config {
         SkippedPaths: []string{},
         AllowedUsers: []string{},
         DefaultReply: "oidc",
+        SessionBackend: "in-memory",
     }
 }
 
@@ -81,7 +86,7 @@ type AuthPlugin struct {
     name         string
     config       *Config
     endpoints    *OIDCEndpoints
-    sessions     *SessionStore
+    sessions     SessionBackend
     callbackPath string
 }
 
@@ -104,34 +109,265 @@ func (a *AuthPlugin) getHTTPClient() *http.Client {
     return http.DefaultClient
 }
 
-type SessionStore struct {
+type SessionBackend interface {
+    Set(sessionID string, data map[string]interface{}) error
+    Get(sessionID string) (map[string]interface{}, bool, error)
+    Delete(sessionID string) error
+}
+
+type InMemorySessionStore struct {
     mu       sync.RWMutex
     sessions map[string]map[string]interface{}
 }
 
-func NewSessionStore() *SessionStore {
-    return &SessionStore{
+func NewInMemorySessionStore() *InMemorySessionStore {
+    return &InMemorySessionStore{
         sessions: make(map[string]map[string]interface{}),
     }
 }
 
-func (s *SessionStore) Set(sessionID string, data map[string]interface{}) {
+func (s *InMemorySessionStore) Set(sessionID string, data map[string]interface{}) error {
     s.mu.Lock()
     defer s.mu.Unlock()
     s.sessions[sessionID] = data
+    return nil
 }
 
-func (s *SessionStore) Get(sessionID string) (map[string]interface{}, bool) {
+func (s *InMemorySessionStore) Get(sessionID string) (map[string]interface{}, bool, error) {
     s.mu.RLock()
     defer s.mu.RUnlock()
     data, exists := s.sessions[sessionID]
-    return data, exists
+    return data, exists, nil
 }
 
-func (s *SessionStore) Delete(sessionID string) {
+func (s *InMemorySessionStore) Delete(sessionID string) error {
     s.mu.Lock()
     defer s.mu.Unlock()
     delete(s.sessions, sessionID)
+    return nil
+}
+
+type RedisSessionStore struct {
+    redisURL string
+    debug    bool
+}
+
+func NewRedisSessionStore(redisURL string, debug bool) *RedisSessionStore {
+    return &RedisSessionStore{
+        redisURL: redisURL,
+        debug:    debug,
+    }
+}
+
+func (r *RedisSessionStore) debugLog(format string, v ...interface{}) {
+    if r.debug {
+        log.Printf("[REDIS-DEBUG] "+format, v...)
+    }
+}
+
+func (r *RedisSessionStore) parseRedisURL() (host, port string, err error) {
+    // Handle different URL formats
+    redisURL := r.redisURL
+    
+    // Remove protocol if present
+    if strings.HasPrefix(redisURL, "http://") {
+        redisURL = strings.TrimPrefix(redisURL, "http://")
+    } else if strings.HasPrefix(redisURL, "redis://") {
+        redisURL = strings.TrimPrefix(redisURL, "redis://")
+    }
+    
+    // Split host and port
+    if strings.Contains(redisURL, ":") {
+        host, port, err = net.SplitHostPort(redisURL)
+        if err != nil {
+            return "", "", err
+        }
+    } else {
+        host = redisURL
+        port = "6379" // Default Redis port
+    }
+    
+    return host, port, nil
+}
+
+func (r *RedisSessionStore) Set(sessionID string, data map[string]interface{}) error {
+    r.debugLog("Setting session data for ID: %s", sessionID)
+    
+    jsonData, err := json.Marshal(data)
+    if err != nil {
+        return fmt.Errorf("failed to marshal session data: %v", err)
+    }
+    
+    // Parse Redis URL to get host and port
+    redisHost, redisPort, err := r.parseRedisURL()
+    if err != nil {
+        return fmt.Errorf("failed to parse Redis URL: %v", err)
+    }
+    
+    // Connect to Redis using TCP
+    conn, err := net.DialTimeout("tcp", net.JoinHostPort(redisHost, redisPort), 5*time.Second)
+    if err != nil {
+        return fmt.Errorf("failed to connect to Redis: %v", err)
+    }
+    defer conn.Close()
+    
+    // Set a timeout for the connection
+    conn.SetDeadline(time.Now().Add(10 * time.Second))
+    
+    key := fmt.Sprintf("session:%s", sessionID)
+    
+    // Send Redis SET command using RESP protocol
+    // Format: *3\r\n$3\r\nSET\r\n$<keylen>\r\n<key>\r\n$<vallen>\r\n<value>\r\n
+    cmd := fmt.Sprintf("*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", 
+        len(key), key, len(jsonData), string(jsonData))
+    
+    _, err = conn.Write([]byte(cmd))
+    if err != nil {
+        return fmt.Errorf("failed to send SET command to Redis: %v", err)
+    }
+    
+    // Read response
+    reader := bufio.NewReader(conn)
+    response, err := reader.ReadString('\n')
+    if err != nil {
+        return fmt.Errorf("failed to read Redis response: %v", err)
+    }
+    
+    if !strings.HasPrefix(response, "+OK") {
+        return fmt.Errorf("Redis SET command failed: %s", strings.TrimSpace(response))
+    }
+    
+    r.debugLog("Session data stored successfully in Redis for ID: %s", sessionID)
+    return nil
+}
+
+func (r *RedisSessionStore) Get(sessionID string) (map[string]interface{}, bool, error) {
+    r.debugLog("Getting session data for ID: %s", sessionID)
+    
+    // Parse Redis URL to get host and port
+    redisHost, redisPort, err := r.parseRedisURL()
+    if err != nil {
+        return nil, false, fmt.Errorf("failed to parse Redis URL: %v", err)
+    }
+    
+    // Connect to Redis using TCP
+    conn, err := net.DialTimeout("tcp", net.JoinHostPort(redisHost, redisPort), 5*time.Second)
+    if err != nil {
+        return nil, false, fmt.Errorf("failed to connect to Redis: %v", err)
+    }
+    defer conn.Close()
+    
+    // Set a timeout for the connection
+    conn.SetDeadline(time.Now().Add(10 * time.Second))
+    
+    key := fmt.Sprintf("session:%s", sessionID)
+    
+    // Send Redis GET command using RESP protocol
+    // Format: *2\r\n$3\r\nGET\r\n$<keylen>\r\n<key>\r\n
+    cmd := fmt.Sprintf("*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n", len(key), key)
+    
+    _, err = conn.Write([]byte(cmd))
+    if err != nil {
+        return nil, false, fmt.Errorf("failed to send GET command to Redis: %v", err)
+    }
+    
+    // Read response
+    reader := bufio.NewReader(conn)
+    response, err := reader.ReadString('\n')
+    if err != nil {
+        return nil, false, fmt.Errorf("failed to read Redis response: %v", err)
+    }
+    
+    response = strings.TrimSpace(response)
+    
+    // Handle null response (key not found)
+    if response == "$-1" {
+        r.debugLog("Session not found in Redis for ID: %s", sessionID)
+        return nil, false, nil
+    }
+    
+    // Handle bulk string response
+    if strings.HasPrefix(response, "$") {
+        // Parse the length
+        lengthStr := response[1:]
+        length, err := strconv.Atoi(lengthStr)
+        if err != nil {
+            return nil, false, fmt.Errorf("failed to parse Redis response length: %v", err)
+        }
+        
+        if length == -1 {
+            r.debugLog("Session not found in Redis for ID: %s", sessionID)
+            return nil, false, nil
+        }
+        
+        // Read the actual data
+        data := make([]byte, length+2) // +2 for \r\n
+        _, err = io.ReadFull(reader, data)
+        if err != nil {
+            return nil, false, fmt.Errorf("failed to read Redis data: %v", err)
+        }
+        
+        // Remove trailing \r\n
+        jsonData := data[:length]
+        
+        var sessionData map[string]interface{}
+        if err := json.Unmarshal(jsonData, &sessionData); err != nil {
+            return nil, false, fmt.Errorf("failed to unmarshal session data: %v", err)
+        }
+        
+        r.debugLog("Session data retrieved successfully from Redis for ID: %s", sessionID)
+        return sessionData, true, nil
+    }
+    
+    return nil, false, fmt.Errorf("unexpected Redis response format: %s", response)
+}
+
+func (r *RedisSessionStore) Delete(sessionID string) error {
+    r.debugLog("Deleting session data for ID: %s", sessionID)
+    
+    // Parse Redis URL to get host and port
+    redisHost, redisPort, err := r.parseRedisURL()
+    if err != nil {
+        return fmt.Errorf("failed to parse Redis URL: %v", err)
+    }
+    
+    // Connect to Redis using TCP
+    conn, err := net.DialTimeout("tcp", net.JoinHostPort(redisHost, redisPort), 5*time.Second)
+    if err != nil {
+        return fmt.Errorf("failed to connect to Redis: %v", err)
+    }
+    defer conn.Close()
+    
+    // Set a timeout for the connection
+    conn.SetDeadline(time.Now().Add(10 * time.Second))
+    
+    key := fmt.Sprintf("session:%s", sessionID)
+    
+    // Send Redis DEL command using RESP protocol
+    // Format: *2\r\n$3\r\nDEL\r\n$<keylen>\r\n<key>\r\n
+    cmd := fmt.Sprintf("*2\r\n$3\r\nDEL\r\n$%d\r\n%s\r\n", len(key), key)
+    
+    _, err = conn.Write([]byte(cmd))
+    if err != nil {
+        return fmt.Errorf("failed to send DEL command to Redis: %v", err)
+    }
+    
+    // Read response
+    reader := bufio.NewReader(conn)
+    response, err := reader.ReadString('\n')
+    if err != nil {
+        return fmt.Errorf("failed to read Redis response: %v", err)
+    }
+    
+    response = strings.TrimSpace(response)
+    
+    // Handle integer response (number of keys deleted)
+    if strings.HasPrefix(response, ":") {
+        r.debugLog("Session data deleted successfully from Redis for ID: %s", sessionID)
+        return nil
+    }
+    
+    return fmt.Errorf("unexpected Redis DEL response: %s", response)
 }
 
 type OIDCEndpoints struct {
@@ -198,12 +434,29 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
         log.Printf("[AUTH-DEBUG] Callback path extracted: %s", callbackPath)
     }
 
+    // Create session backend based on configuration
+    var sessionBackend SessionBackend
+    if config.SessionBackend == "" || config.SessionBackend == "in-memory" {
+        if config.Debug {
+            log.Printf("[AUTH-DEBUG] Using in-memory session backend")
+        }
+        sessionBackend = NewInMemorySessionStore()
+    } else if strings.HasPrefix(config.SessionBackend, "redis:") {
+        redisURL := strings.TrimPrefix(config.SessionBackend, "redis:")
+        if config.Debug {
+            log.Printf("[AUTH-DEBUG] Using Redis session backend with URL: %s", redisURL)
+        }
+        sessionBackend = NewRedisSessionStore(redisURL, config.Debug)
+    } else {
+        return nil, fmt.Errorf("unsupported session backend: %s (supported: 'in-memory' or 'redis:REDIS_URL')", config.SessionBackend)
+    }
+
     return &AuthPlugin{
         next:         next,
         name:         name,
         config:       config,
         endpoints:    endpoints,
-        sessions:     NewSessionStore(),
+        sessions:     sessionBackend,
         callbackPath: callbackPath,
     }, nil
 }
@@ -335,7 +588,11 @@ func (a *AuthPlugin) handleCallback(rw http.ResponseWriter, req *http.Request) {
     }
 
     // Store token data in session store
-    a.sessions.Set(sessionID, tokenData)
+    if err := a.sessions.Set(sessionID, tokenData); err != nil {
+        a.debugLog("Failed to store token in session store: %v", err)
+        http.Error(rw, "Failed to store session", http.StatusInternalServerError)
+        return
+    }
     a.debugLog("Stored token in session store with ID: %s", sessionID)
 
     // Also set as cookie for persistence
@@ -410,14 +667,19 @@ func (a *AuthPlugin) handleLogout(rw http.ResponseWriter, req *http.Request) {
     
     // Try to get ID token from session store first
     if sessionCookie, err := req.Cookie("traefik_session_id"); err == nil {
-        if tokenData, exists := a.sessions.Get(sessionCookie.Value); exists {
+        if tokenData, exists, err := a.sessions.Get(sessionCookie.Value); err == nil && exists {
             if idTokenStr, ok := tokenData["id_token"].(string); ok {
                 idToken = idTokenStr
                 a.debugLog("Found ID token in session store for logout")
             }
             // Delete from session store
-            a.sessions.Delete(sessionCookie.Value)
-            a.debugLog("Deleted session from store")
+            if err := a.sessions.Delete(sessionCookie.Value); err != nil {
+                a.debugLog("Failed to delete session from store: %v", err)
+            } else {
+                a.debugLog("Deleted session from store")
+            }
+        } else if err != nil {
+            a.debugLog("Failed to get session from store: %v", err)
         }
     }
     
@@ -514,9 +776,11 @@ func (a *AuthPlugin) hasValidToken(req *http.Request) bool {
     // First try to get token from session store
     if sessionCookie, err := req.Cookie("traefik_session_id"); err == nil {
         a.debugLog("Found session ID cookie: %s", sessionCookie.Value)
-        if tokenData, exists := a.sessions.Get(sessionCookie.Value); exists {
+        if tokenData, exists, err := a.sessions.Get(sessionCookie.Value); err == nil && exists {
             a.debugLog("Found token in session store")
             return a.validateTokenData(tokenData)
+        } else if err != nil {
+            a.debugLog("Failed to get session from store: %v", err)
         } else {
             a.debugLog("Session ID not found in session store")
         }
