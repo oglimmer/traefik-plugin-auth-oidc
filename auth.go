@@ -93,6 +93,25 @@ type AuthPlugin struct {
     callbackPath string
 }
 
+// Global cache for OIDC endpoints to survive config reloads
+var (
+    globalEndpointsCache      = make(map[string]*OIDCEndpoints)
+    globalEndpointsCacheMutex sync.RWMutex
+    globalEndpointsCacheTTL   = 1 * time.Hour
+)
+
+// Global cache for JWKS to prevent fetching on every request
+type jwksCacheEntry struct {
+    jwks      *JWKSet
+    timestamp time.Time
+}
+
+var (
+    globalJWKSCache      = make(map[string]*jwksCacheEntry)
+    globalJWKSCacheMutex sync.RWMutex
+    globalJWKSCacheTTL   = 1 * time.Hour
+)
+
 func (a *AuthPlugin) debugLog(format string, v ...interface{}) {
     if a.config.Debug {
         log.Printf("[AUTH-DEBUG] "+format, v...)
@@ -990,29 +1009,92 @@ func (a *AuthPlugin) fetchJWKS() (*JWKSet, error) {
         return nil, fmt.Errorf("no JWKS URI configured")
     }
 
+    // Check cache first
+    globalJWKSCacheMutex.RLock()
+    if entry, exists := globalJWKSCache[a.endpoints.JwksUri]; exists {
+        if time.Since(entry.timestamp) < globalJWKSCacheTTL {
+            a.debugLog("Using cached JWKS (age: %v)", time.Since(entry.timestamp))
+            globalJWKSCacheMutex.RUnlock()
+            return entry.jwks, nil
+        }
+    }
+    globalJWKSCacheMutex.RUnlock()
+
     a.debugLog("Fetching JWKS from: %s", a.endpoints.JwksUri)
     client := a.getHTTPClient()
     resp, err := client.Get(a.endpoints.JwksUri)
     if err != nil {
+        a.debugLog("Failed to fetch JWKS: %v", err)
+
+        // Try to use stale cache as fallback
+        globalJWKSCacheMutex.RLock()
+        if entry, exists := globalJWKSCache[a.endpoints.JwksUri]; exists {
+            a.debugLog("Using stale cached JWKS as fallback (age: %v)", time.Since(entry.timestamp))
+            globalJWKSCacheMutex.RUnlock()
+            return entry.jwks, nil
+        }
+        globalJWKSCacheMutex.RUnlock()
+
         return nil, err
     }
     defer resp.Body.Close()
 
     if resp.StatusCode != http.StatusOK {
+        a.debugLog("JWKS endpoint returned status: %d", resp.StatusCode)
+
+        // Try to use stale cache as fallback
+        globalJWKSCacheMutex.RLock()
+        if entry, exists := globalJWKSCache[a.endpoints.JwksUri]; exists {
+            a.debugLog("Using stale cached JWKS as fallback (age: %v)", time.Since(entry.timestamp))
+            globalJWKSCacheMutex.RUnlock()
+            return entry.jwks, nil
+        }
+        globalJWKSCacheMutex.RUnlock()
+
         return nil, fmt.Errorf("JWKS endpoint returned status: %d", resp.StatusCode)
     }
 
     body, err := io.ReadAll(resp.Body)
     if err != nil {
+        a.debugLog("Failed to read JWKS response: %v", err)
+
+        // Try to use stale cache as fallback
+        globalJWKSCacheMutex.RLock()
+        if entry, exists := globalJWKSCache[a.endpoints.JwksUri]; exists {
+            a.debugLog("Using stale cached JWKS as fallback (age: %v)", time.Since(entry.timestamp))
+            globalJWKSCacheMutex.RUnlock()
+            return entry.jwks, nil
+        }
+        globalJWKSCacheMutex.RUnlock()
+
         return nil, err
     }
 
     var jwks JWKSet
     if err := json.Unmarshal(body, &jwks); err != nil {
+        a.debugLog("Failed to unmarshal JWKS: %v", err)
+
+        // Try to use stale cache as fallback
+        globalJWKSCacheMutex.RLock()
+        if entry, exists := globalJWKSCache[a.endpoints.JwksUri]; exists {
+            a.debugLog("Using stale cached JWKS as fallback (age: %v)", time.Since(entry.timestamp))
+            globalJWKSCacheMutex.RUnlock()
+            return entry.jwks, nil
+        }
+        globalJWKSCacheMutex.RUnlock()
+
         return nil, err
     }
 
-    a.debugLog("Fetched %d keys from JWKS", len(jwks.Keys))
+    // Cache the fresh JWKS
+    globalJWKSCacheMutex.Lock()
+    globalJWKSCache[a.endpoints.JwksUri] = &jwksCacheEntry{
+        jwks:      &jwks,
+        timestamp: time.Now(),
+    }
+    globalJWKSCacheMutex.Unlock()
+
+    a.debugLog("Fetched and cached %d keys from JWKS", len(jwks.Keys))
     return &jwks, nil
 }
 
@@ -1191,11 +1273,22 @@ func (a *AuthPlugin) exchangeCodeForToken(code string) (*TokenResponse, error) {
 }
 
 func discoverOIDCEndpoints(issuerURL string, debug bool, insecureTLS bool) (*OIDCEndpoints, error) {
+    // Check global cache first
+    globalEndpointsCacheMutex.RLock()
+    if cachedEndpoints, exists := globalEndpointsCache[issuerURL]; exists {
+        if debug {
+            log.Printf("[AUTH-DEBUG] Using cached OIDC endpoints for %s", issuerURL)
+        }
+        globalEndpointsCacheMutex.RUnlock()
+        return cachedEndpoints, nil
+    }
+    globalEndpointsCacheMutex.RUnlock()
+
     wellKnownURL := strings.TrimSuffix(issuerURL, "/") + "/.well-known/openid-configuration"
     if debug {
         log.Printf("[AUTH-DEBUG] Fetching OIDC configuration from: %s", wellKnownURL)
     }
-    
+
     client := http.DefaultClient
     if insecureTLS {
         client = &http.Client{
@@ -1209,13 +1302,13 @@ func discoverOIDCEndpoints(issuerURL string, debug bool, insecureTLS bool) (*OID
             log.Printf("[AUTH-DEBUG] Using insecure TLS for OIDC discovery")
         }
     }
-    
+
     resp, err := client.Get(wellKnownURL)
     if err != nil {
         if debug {
             log.Printf("[AUTH-DEBUG] Failed to fetch OIDC configuration: %v", err)
         }
-        return loadFallbackConfiguration(debug)
+        return loadFallbackConfiguration(issuerURL, debug)
     }
     defer resp.Body.Close()
 
@@ -1223,7 +1316,7 @@ func discoverOIDCEndpoints(issuerURL string, debug bool, insecureTLS bool) (*OID
         if debug {
             log.Printf("[AUTH-DEBUG] OIDC configuration endpoint returned status: %d", resp.StatusCode)
         }
-        return loadFallbackConfiguration(debug)
+        return loadFallbackConfiguration(issuerURL, debug)
     }
 
     body, err := io.ReadAll(resp.Body)
@@ -1231,7 +1324,7 @@ func discoverOIDCEndpoints(issuerURL string, debug bool, insecureTLS bool) (*OID
         if debug {
             log.Printf("[AUTH-DEBUG] Failed to read OIDC configuration response: %v", err)
         }
-        return loadFallbackConfiguration(debug)
+        return loadFallbackConfiguration(issuerURL, debug)
     }
 
     if debug {
@@ -1243,39 +1336,79 @@ func discoverOIDCEndpoints(issuerURL string, debug bool, insecureTLS bool) (*OID
         if debug {
             log.Printf("[AUTH-DEBUG] Failed to unmarshal OIDC configuration: %v", err)
         }
-        return loadFallbackConfiguration(debug)
+        return loadFallbackConfiguration(issuerURL, debug)
+    }
+
+    // Cache the successfully discovered endpoints
+    globalEndpointsCacheMutex.Lock()
+    globalEndpointsCache[issuerURL] = &endpoints
+    globalEndpointsCacheMutex.Unlock()
+
+    if debug {
+        log.Printf("[AUTH-DEBUG] Cached OIDC endpoints for %s", issuerURL)
     }
 
     return &endpoints, nil
 }
 
-func loadFallbackConfiguration(debug bool) (*OIDCEndpoints, error) {
+func loadFallbackConfiguration(issuerURL string, debug bool) (*OIDCEndpoints, error) {
     if debug {
         log.Printf("[AUTH-DEBUG] Loading fallback OIDC configuration from ./openid-configuration.json")
     }
-    
+
     body, err := ioutil.ReadFile("./openid-configuration.json")
     if err != nil {
         if debug {
             log.Printf("[AUTH-DEBUG] Failed to read fallback configuration file: %v", err)
         }
-        return nil, fmt.Errorf("failed to load fallback OIDC configuration: %v", err)
+
+        // Try to use previously cached endpoints as last resort
+        globalEndpointsCacheMutex.RLock()
+        cachedEndpoints, exists := globalEndpointsCache[issuerURL]
+        globalEndpointsCacheMutex.RUnlock()
+
+        if exists {
+            if debug {
+                log.Printf("[AUTH-DEBUG] Using previously cached OIDC endpoints as fallback for %s", issuerURL)
+            }
+            return cachedEndpoints, nil
+        }
+
+        return nil, fmt.Errorf("failed to load fallback OIDC configuration and no cached endpoints available: %v", err)
     }
-    
+
     var endpoints OIDCEndpoints
     if err := json.Unmarshal(body, &endpoints); err != nil {
         if debug {
             log.Printf("[AUTH-DEBUG] Failed to unmarshal fallback OIDC configuration: %v", err)
         }
-        return nil, fmt.Errorf("failed to parse fallback OIDC configuration: %v", err)
+
+        // Try to use previously cached endpoints as last resort
+        globalEndpointsCacheMutex.RLock()
+        cachedEndpoints, exists := globalEndpointsCache[issuerURL]
+        globalEndpointsCacheMutex.RUnlock()
+
+        if exists {
+            if debug {
+                log.Printf("[AUTH-DEBUG] Using previously cached OIDC endpoints as fallback for %s", issuerURL)
+            }
+            return cachedEndpoints, nil
+        }
+
+        return nil, fmt.Errorf("failed to parse fallback OIDC configuration and no cached endpoints available: %v", err)
     }
-    
+
+    // Cache the fallback endpoints too
+    globalEndpointsCacheMutex.Lock()
+    globalEndpointsCache[issuerURL] = &endpoints
+    globalEndpointsCacheMutex.Unlock()
+
     if debug {
-        log.Printf("[AUTH-DEBUG] Fallback OIDC configuration loaded successfully")
-        log.Printf("[AUTH-DEBUG] Fallback endpoints - Auth: %s, Token: %s", 
+        log.Printf("[AUTH-DEBUG] Fallback OIDC configuration loaded successfully and cached")
+        log.Printf("[AUTH-DEBUG] Fallback endpoints - Auth: %s, Token: %s",
             endpoints.AuthorizationEndpoint, endpoints.TokenEndpoint)
     }
-    
+
     return &endpoints, nil
 }
 
